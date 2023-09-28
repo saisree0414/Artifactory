@@ -1,0 +1,37 @@
+---
+- name: Get list of files in JFrog Artifactory folder
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: Authenticate to JFrog Artifactory
+      uri:
+        url: "https://your-artifactory-url/artifactory/api/security/token"
+        method: POST
+        user: "{{ artifactory_username }}"
+        password: "{{ artifactory_password }}"
+        force_basic_auth: yes
+        status_code: 200
+        body_format: form-urlencoded
+        body: "username={{ artifactory_username }}&scope=api:*"
+
+      register: auth_result
+
+    - name: Get list of files
+      uri:
+        url: "https://your-artifactory-url/artifactory/api/storage/{{ artifactory_repository }}/{{ artifactory_folder }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ auth_result.json.access_token }}"
+        return_content: yes
+
+      register: list_files_result
+
+    - debug:
+        var: list_files_result.json.children
+
+  vars:
+    artifactory_username: "your_username"
+    artifactory_password: "your_password"
+    artifactory_repository: "your_repository"
+    artifactory_folder: "path/to/your/folder"
