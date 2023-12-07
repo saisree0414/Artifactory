@@ -1,0 +1,11 @@
+items.find(
+  {
+    "repo": "your-repo-name",
+    "path": {"$eq": "your/path/to/artifacts"},
+    "$and": [
+      {"created": {"$before": "6months"}},
+      {"name": {"$nmatch": "latest"}},
+      {"type": "file"}
+    ]
+  }
+).include("name", "repo", "path", "created")
