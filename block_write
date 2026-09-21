@@ -1,0 +1,407 @@
+import json
+import psycopg2
+import urllib.request
+import urllib.error
+import sys
+import smtplib
+import xml.etree.ElementTree as ET
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# ==================== CONFIGURATION ====================
+ARTIFACTORY_URL = "https://jfrog.io.company.com/artifactory"
+API_KEY = "<token>"
+
+# PostgreSQL Connection Parameters
+DB_CONFIG = {
+    "dbname": "<db>",
+    "user": "<user>",
+    "password": "<pass>",
+    "host": "<DB-endpoint>",
+    "port": 5432
+}
+
+# SMTP Email Configuration
+SMTP_SERVER = "vzsmtp.company.com"  # e.g., corporate SMTP relay host
+SMTP_PORT = 25  # Typically 25 or 587
+EMAIL_FROM = "blm-communications@company.com"
+
+# Leadership Notification Routing Matrix
+LEADERSHIP_EMAILS = [
+    "rxyz@company.com", 
+    "123@company.com", 
+    "abc@company.com"
+]
+
+TARGET_APPIDS = [
+    "ADXV", "AGAV", "AIXV", "ALLV", 
+]
+# =======================================================
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
+}
+
+def init_db():
+    """Initializes PostgreSQL tables if they don't exist."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS repository_configs_ple (
+                repo_key VARCHAR(255) PRIMARY KEY,
+                permission_target VARCHAR(255) NOT NULL,
+                limit_gb NUMERIC(10, 2) NOT NULL
+            );
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS permission_backups (
+                repo_key VARCHAR(255) PRIMARY KEY,
+                permission_target VARCHAR(255) NOT NULL,
+                backup_json JSONB NOT NULL,
+                locked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        ''')
+        
+        cursor.execute("SELECT COUNT(*) FROM repository_configs_ple;")
+        if cursor.fetchone()[0] == 0:
+            sample_data = [
+                ("tag_Maven-Secure", "tag-maven-secure-perm", 1.0),
+                ("tag_replicationtest", "tag_replicationtest-perm", 4.0),
+                ("tag-package-prod", "tag-package-prod-perm", 1.0)
+            ]
+            cursor.executemany(
+                "INSERT INTO repository_configs_ple (repo_key, permission_target, limit_gb) VALUES (%s, %s, %s);", 
+                sample_data
+            )
+            print(f"[+] Seeded PostgreSQL database with {len(sample_data)} default configurations.")
+            
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"[-] PostgreSQL Database initialization failed: {e}")
+        sys.exit(1)
+
+def get_managed_repositories():
+    """Fetches configured repositories from PostgreSQL."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute("SELECT repo_key, permission_target, limit_gb FROM repository_configs_ple;")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [{"repo_key": r[0], "permission_target": r[1], "limit_bytes": int(float(r[2]) * 1024**3)} for r in rows]
+
+def is_repo_locked_in_db(repo_key):
+    """Checks if the repository has a snapshot stored in the backups table."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM permission_backups WHERE repo_key = %s;", (repo_key,))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return result is not None
+
+def make_request(url, method="GET", data=None):
+    """Executes REST API Calls."""
+    req = urllib.request.Request(url, headers=HEADERS, method=method)
+    if data:
+        req.data = json.dumps(data).encode("utf-8")
+    try:
+        with urllib.request.urlopen(req) as response:
+            if response.status in [200, 201]:
+                raw_content = response.read().decode("utf-8").strip()
+                if not raw_content:
+                    return {"status": "success", "message": "Empty response body received"}
+                try:
+                    return json.loads(raw_content)
+                except json.JSONDecodeError:
+                    return {"status": "success", "message": raw_content}
+            return None
+    except urllib.error.HTTPError as e:
+        print(f"  [-] Artifactory API Error ({e.code}): {e.read().decode('utf-8')}")
+        return None
+    except Exception as e:
+        print(f"  [-] Connection Error to Artifactory: {e}")
+        return None
+
+def get_all_repo_sizes():
+    """Queries global storageinfo endpoint summary."""
+    url = f"{ARTIFACTORY_URL}/api/storageinfo"
+    result = make_request(url)
+    
+    sizes = {}
+    if result and "repositoriesSummaryList" in result:
+        for repo_data in result["repositoriesSummaryList"]:
+            repo_key = repo_data.get("repoKey")
+            if not repo_key:
+                continue
+            raw_space = repo_data.get("usedSpaceInBytes", 0)
+            if isinstance(raw_space, str):
+                raw_space = raw_space.replace(",", "").replace(" ", "").strip()
+            try:
+                space = int(raw_space) if raw_space else 0
+            except (ValueError, TypeError):
+                space = 0
+            sizes[repo_key] = space
+    return sizes
+
+def get_custodian_emails(appID):
+    """Fetches Application Custodian Email from company VAST Service XML API."""
+    custodian_email = ''
+    url = f"https://vast-services.company.com/apm/hygieia/getapplicationdetails?ApplID={appID}"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req) as response:
+            if response.status == 200:
+                xml_data = response.read().decode("utf-8")
+                root = ET.fromstring(xml_data)
+                ns = {'ns': 'company.VAST.ExternalAccess'}
+                email_element = root.find('.//ns:CustodianEmail', ns)
+                if email_element is not None and email_element.text:
+                    custodian_email = email_element.text.strip()
+                    print(f"  [+] Found Custodian from VAST for AppID '{appID}': {custodian_email}")
+    except Exception as e:
+        print(f"  [-] Error querying/parsing VAST XML for AppID '{appID}': {e}")
+    return custodian_email
+
+def extract_affected_users(data):
+    """Recursively scans the layout structure to collect user keys who have active write scopes."""
+    users = set()
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key == "users" and isinstance(value, dict):
+                for username, permissions in value.items():
+                    if isinstance(permissions, list) and "write" in permissions:
+                        users.add(username)
+                    elif isinstance(permissions, dict) and "permissions" in permissions:
+                        if "write" in permissions["permissions"]:
+                            users.add(username)
+            else:
+                users.update(extract_affected_users(value))
+    elif isinstance(data, list):
+        for item in data:
+            users.update(extract_affected_users(item))
+    return users
+
+def get_user_emails_from_api(usernames):
+    """Calls user API to get email dynamically for each username."""
+    email_addresses = []
+    for username in usernames:
+        u_url = f"{ARTIFACTORY_URL}/api/security/users/{username}"
+        user_profile = make_request(u_url)
+        if user_profile and "email" in user_profile:
+            email = user_profile["email"]
+            if email and "@" in email:
+                email_addresses.append(email.strip())
+    return email_addresses
+
+def send_notification_email(recipients, subject, body):
+    """Dispatches a text message out via company SMTP servers."""
+    if not recipients:
+        print("  [*] No valid user, custodian, or leadership emails discovered. Skipping dispatch.")
+        return
+    
+    # Deduplicate distribution list items cleanly
+    recipients = list(set([r for r in recipients if r]))
+    
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_FROM
+    msg['To'] = ", ".join(recipients)
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.sendmail(EMAIL_FROM, recipients, msg.as_string())
+        print(f"  [✓] Notification email successfully sent to: {', '.join(recipients)}")
+    except Exception as e:
+        print(f"  [-] Failed to route notification email via SMTP: {e}")
+
+def remove_write_and_manage_recursively(data):
+    """Recursively eliminates 'write' and 'manage' array attributes."""
+    modified = False
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, list) and ("write" in value or "manage" in value):
+                data[key] = [p for p in value if p not in ["write", "manage"]]
+                modified = True
+            else:
+                if remove_write_and_manage_recursively(value):
+                    modified = True
+    elif isinstance(data, list):
+        for item in data:
+            if remove_write_and_manage_recursively(item):
+                modified = True
+    return modified
+
+def db_backup_and_lock(repo_key, permission_target):
+    """Downloads permissions, processes conditional leadership triggers, locks target, and sends notification."""
+    url = f"{ARTIFACTORY_URL}/api/v2/security/permissions/{permission_target}"
+    print(f"  [+] Downloading live permissions for target: {permission_target}")
+    current_perm = make_request(url)
+    
+    if not current_perm or "status" in current_perm:
+        print(f"  [-] Permission target '{permission_target}' not found or invalid format. Aborting workflow.")
+        return
+
+    # 1. Collect standard target users and their emails
+    affected_usernames = list(extract_affected_users(current_perm))
+    all_recipients = get_user_emails_from_api(affected_usernames)
+
+    # 2. Extract AppID (first 4 letters) and grab VAST custodian email
+    appID = repo_key[:4].upper()
+    custodian = get_custodian_emails(appID)
+    if custodian:
+        all_recipients.append(custodian)
+
+    # 3. Conditional Leadership Email Routing Switch
+    if appID in TARGET_APPIDS:
+        print(f"  [!] Match Found: AppID '{appID}' is a target environment. Adding Leadership to alerts.")
+        all_recipients.extend(LEADERSHIP_EMAILS)
+
+    # Store backup json directly using native PostgreSQL JSON features
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO permission_backups (repo_key, permission_target, backup_json) VALUES (%s, %s, %s);",
+        (repo_key, permission_target, json.dumps(current_perm))
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("  [✓] Current permissions successfully locked into PostgreSQL 'permission_backups' table.")
+
+    # Execute deep recursive clean to strip out privileges
+    remove_write_and_manage_recursively(current_perm)
+
+    # Apply modified layout
+    print("  [!] Overwriting permissions with strict Read-Only layout...")
+    response = make_request(url, method="PUT", data=current_perm)
+    if response:
+        print(f"  [✓] Repository '{repo_key}' has been locked out of write and manage operations.")
+        
+        # Trigger Lock Alert Emails
+        subject = f"[URGENT BLOCK] Write Operations Revoked on Artifactory Repository: {repo_key}"
+        body = (f"Hello Custodian / Artifactory User,\n\n"
+                f"This is an automated infrastructure notification alerting you that your repository '{repo_key}' "
+                f"(Associated AppID: {appID}) has breached its assigned storage space limits.\n\n"
+                f"ACTION TAKEN: Your deployment ('write') and layout alteration ('manage') scopes under "
+                f"permission target '{permission_target}' have been temporarily suspended.\n"
+                f"CURRENT ACCESS MODE: READ-ONLY.\n\n"
+                f"Please clean up legacy/unused artifacts or coordinate with an administrator to clear space. "
+                f"Write privileges will be automatically reinstated once the usage returns below the threshold.\n\n"
+                f"Regards,\nArtifactory Systems Administration")
+        send_notification_email(all_recipients, subject, body)
+    else:
+        print(f"  [-] Failed to update permissions target in Artifactory.")
+
+def db_restore_permissions(repo_key, permission_target):
+    """Restores the permission structure back from PG, builds conditional targets, and sends restoration email."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute("SELECT backup_json FROM permission_backups WHERE repo_key = %s;", (repo_key,))
+    row = cursor.fetchone()
+    
+    if not row:
+        cursor.close()
+        conn.close()
+        return
+
+    original_perm = row[0]
+    affected_usernames = list(extract_affected_users(original_perm))
+    all_recipients = get_user_emails_from_api(affected_usernames)
+    
+    # Extract AppID and resolve associated users
+    appID = repo_key[:4].upper()
+    custodian = get_custodian_emails(appID)
+    if custodian:
+        all_recipients.append(custodian)
+        
+    # Append Leadership conditionally on restore operations as well
+    if appID in TARGET_APPIDS:
+        all_recipients.extend(LEADERSHIP_EMAILS)
+    
+    url = f"{ARTIFACTORY_URL}/api/v2/security/permissions/{permission_target}"
+    print(f"  [+] Restoring layout extracted from Postgres for target: {permission_target}")
+    
+    response = make_request(url, method="PUT", data=original_perm)
+    if response:
+        cursor.execute("DELETE FROM permission_backups WHERE repo_key = %s;", (repo_key,))
+        conn.commit()
+        print(f"  [✓] Production access restored. Backup deleted from PostgreSQL tracking.")
+        
+        # Trigger Restoration Success Emails
+        subject = f"[RESTORED] Write Access Reinstated for Artifactory Repository: {repo_key}"
+        body = (f"Hello Custodian / Artifactory User,\n\n"
+                f"Great news! Your repository '{repo_key}' (Associated AppID: {appID}) has successfully cleared "
+                f"up enough storage volume to fall safely back under its configured allocation line.\n\n"
+                f"ACTION TAKEN: Your original full deployment ('write') and target alteration ('manage') scopes "
+                f"inside target configuration '{permission_target}' have been completely restored.\n"
+                f"CURRENT ACCESS MODE: NORMAL (READ & WRITE).\n\n"
+                f"Thank you for your cleanup cooperation.\n\n"
+                f"Regards,\nArtifactory Systems Administration")
+        send_notification_email(all_recipients, subject, body)
+    else:
+        print(f"  [-] Failed to restore permissions target in Artifactory. Keeping DB backup trace.")
+        
+    cursor.close()
+    conn.close()
+
+def main():
+    print("=== Artifactory PostgreSQL-Driven Storage Monitor ===")
+    init_db()
+    
+    managed_repos = get_managed_repositories()
+    
+    print("[+] Querying global storage summary from Artifactory...")
+    storage_summary = get_all_repo_sizes()
+    
+    if not storage_summary:
+        print("[!] Global summary returned empty. Falling back to individual repository checks...")
+        storage_summary = {}
+        for repo in managed_repos:
+            rk = repo["repo_key"]
+            url = f"{ARTIFACTORY_URL}/api/storage/{rk}"
+            res = make_request(url)
+            if res and "usedSpaceInBytes" in res:
+                storage_summary[rk] = int(str(res["usedSpaceInBytes"]).replace(",", ""))
+            else:
+                storage_summary[rk] = None
+    
+    for repo in managed_repos:
+        repo_key = repo["repo_key"]
+        perm_target = repo["permission_target"]
+        limit = repo["limit_bytes"]
+        
+        print(f"\n--- Processing Repository: {repo_key} ---")
+        
+        current_size = storage_summary.get(repo_key)
+        if current_size is None:
+            print(f"  [-] Skipping processing for '{repo_key}': Key data not present in storage report.")
+            continue
+            
+        print(f"  [+] Current Size: {current_size / (1024**3):.2f} GB")
+        print(f"  [+] Quota Limit:  {limit / (1024**3):.2f} GB")
+
+        is_locked = is_repo_locked_in_db(repo_key)
+
+        if current_size >= limit:
+            if not is_locked:
+                print(f"  [!] CRITICAL: Storage threshold breached! Executing system lock.")
+                db_backup_and_lock(repo_key, perm_target)
+            else:
+                print(f"  [*] NOTICE: Repository remains locked. Actively logged in Postgres.")
+        else:
+            if is_locked:
+                print(f"  [+] RESOLVED: Storage falls back safely under configured limit. Restoring write rights.")
+                db_restore_permissions(repo_key, perm_target)
+            else:
+                print(f"  [✓] HEALTHY: Repository size conforms to parameters.")
+
+if __name__ == "__main__":
+    main()
